@@ -1,0 +1,12 @@
+# SaaS WebSocket URL (where the agent connects to receive commands)
+saas_url: ws://localhost:9000/agent/ws
+
+# HTTP base used to fetch/upload file content
+http_base_url: http://localhost:9000
+
+# Auth token (must match the one configured on the SaaS side)
+token: dev-token
+
+# Local base path where files will be written.
+# In production on Windows, e.g.: C:\rede\clientes
+base_path: ./data/clientes

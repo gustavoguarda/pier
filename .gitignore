@@ -1,0 +1,17 @@
+# Build output
+/dist/
+*.exe
+
+# Local config (contains secrets)
+config.yaml
+
+# Runtime data from saas-stub or agent in dev
+/data/
+
+# macOS
+.DS_Store
+
+# Editor / tooling
+/.claude/
+/.vscode/
+/.idea/
