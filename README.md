@@ -8,7 +8,7 @@
 - The customer's IT won't open inbound ports, won't run a VPN client, won't expose their server.
 - You don't want to depend on SMB, FTP, or sync tools you can't control.
 
-It's the **inverted polarity** of SMB/SFTP: instead of *your SaaS connecting in*, the *on-prem agent connects out*.
+It's the **inverted polarity** of SMB/SFTP: instead of _your SaaS connecting in_, the _on-prem agent connects out_.
 
 ## Architecture
 
@@ -28,10 +28,10 @@ The agent only ever **opens** connections — it never accepts them. The SaaS is
 
 This repo ships two binaries:
 
-| Binary | Where it runs | Purpose |
-|---|---|---|
-| `agent` | On-prem server (your customer's machine, Windows usually) | Connects out to the SaaS, executes file write/read commands |
-| `saas-stub` | Anywhere you can host an HTTP service | **Reference implementation** of the HTTP+WS contract. Useful for local end-to-end testing and as a starting point if you're building your own SaaS endpoint. **Not intended for production as-is** (in-memory queue, single agent, no persistence). |
+| Binary      | Where it runs                                             | Purpose                                                                                                                                                                                                                                             |
+| ----------- | --------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `agent`     | On-prem server (your customer's machine, Windows usually) | Connects out to the SaaS, executes file write/read commands                                                                                                                                                                                         |
+| `saas-stub` | Anywhere you can host an HTTP service                     | **Reference implementation** of the HTTP+WS contract. Useful for local end-to-end testing and as a starting point if you're building your own SaaS endpoint. **Not intended for production as-is** (in-memory queue, single agent, no persistence). |
 
 If you're plugging `pier` into an existing SaaS, you'll usually write your own SaaS-side adapter (Node, PHP, Python, whatever) that speaks the same HTTP+WS contract as `saas-stub`.
 
@@ -77,7 +77,12 @@ The SaaS sends JSON commands over the WebSocket connection.
 ### Write — SaaS pushes a file to the agent
 
 ```json
-{"action": "write", "client": "Cliente A", "filename": "x.pdf", "file_url": "/files/123"}
+{
+  "action": "write",
+  "client": "Cliente A",
+  "filename": "x.pdf",
+  "file_url": "/files/123"
+}
 ```
 
 The agent fetches `file_url` (relative to `http_base_url`, or absolute as long as the host matches) with `Authorization: Bearer <token>` and writes the body to `<base_path>/<client>/<filename>`.
@@ -85,8 +90,13 @@ The agent fetches `file_url` (relative to `http_base_url`, or absolute as long a
 ### Read — SaaS asks the agent to send a file back
 
 ```json
-{"action": "read", "client": "Cliente A", "filename": "x.pdf",
- "upload_url": "/agent/responses/<request_id>", "request_id": "<request_id>"}
+{
+  "action": "read",
+  "client": "Cliente A",
+  "filename": "x.pdf",
+  "upload_url": "/agent/responses/<request_id>",
+  "request_id": "<request_id>"
+}
 ```
 
 The agent reads `<base_path>/<client>/<filename>` and POSTs the body to `upload_url` with the bearer token. The SaaS uses `request_id` to match the response with the original HTTP caller.
@@ -96,10 +106,10 @@ The agent reads `<base_path>/<client>/<filename>` and POSTs the body to `upload_
 `config.yaml`:
 
 ```yaml
-saas_url: wss://saas.example.com/agent/ws    # required
-http_base_url: https://saas.example.com      # required
-token: your-shared-token                     # auth header value
-base_path: C:\rede\clientes                  # required; on Windows
+saas_url: wss://saas.example.com/agent/ws # required
+http_base_url: https://saas.example.com # required
+token: your-shared-token # auth header value
+base_path: C:\rede\clientes # required; on Windows
 ```
 
 ## Run as Windows Service
@@ -130,10 +140,6 @@ Other service actions: `stop`, `restart`, `uninstall`.
 
 - [`docs/install-windows.md`](docs/install-windows.md) — end-to-end install on a Windows server
 - [`docs/diagnostics.md`](docs/diagnostics.md) — observability commands for SaaS↔agent uploads
-
-## Status
-
-Used in production by [Lifleg Contabilidade](https://github.com/lifleg-org/contabilidade) since May 2026 as the file-delivery layer between a multi-tenant Laravel SaaS and accounting offices' Windows servers.
 
 ## License
 
