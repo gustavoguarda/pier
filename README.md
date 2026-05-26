@@ -138,7 +138,8 @@ Other service actions: `stop`, `restart`, `uninstall`.
 
 ## Docs
 
-- [`docs/install-windows.md`](docs/install-windows.md) — end-to-end install on a Windows server
+- [`docs/local-development.md`](docs/local-development.md) — run the full pipeline locally (saas-stub + Windows VM in UTM)
+- [`docs/install-windows.md`](docs/install-windows.md) — end-to-end install on a Windows server (production)
 - [`docs/diagnostics.md`](docs/diagnostics.md) — observability commands for SaaS↔agent uploads
 
 ## License

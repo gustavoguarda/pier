@@ -8,6 +8,8 @@ import (
 	"net/http"
 	"os"
 	"path"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -18,20 +20,32 @@ import (
 
 const responseWait = 30 * time.Second
 
+const (
+	defaultDataDir       = "/data"
+	defaultRetentionDays = 30
+	cleanupInterval      = 24 * time.Hour
+	cleanupInitialDelay  = 5 * time.Minute
+)
+
+// fileEntry is the lookup record for a queued upload. Content lives on disk
+// under <dataDir>/<client>/<filename>; we keep client/filename in memory just
+// to translate file IDs (used in /files/<id> URLs) back to the disk path.
 type fileEntry struct {
 	Filename string
 	Client   string
-	Content  []byte
+	DiskPath string
 }
 
 type server struct {
-	mu            sync.Mutex
-	files         map[string]fileEntry
-	responses     map[string]chan []byte
-	nextID        int
-	agent         *websocket.Conn
-	agentMu       sync.Mutex
-	expectedToken string
+	mu             sync.Mutex
+	files          map[string]fileEntry
+	responses      map[string]chan []byte
+	nextID         int
+	agent          *websocket.Conn
+	agentMu        sync.Mutex
+	expectedToken  string
+	dataDir        string
+	retentionHours time.Duration
 }
 
 var upgrader = websocket.Upgrader{
@@ -63,10 +77,31 @@ func main() {
 		}
 	}
 
+	// Data dir resolution (env > default).
+	resolvedDataDir := os.Getenv("STORAGE_DATA_DIR")
+	if resolvedDataDir == "" {
+		resolvedDataDir = defaultDataDir
+	}
+	if err := os.MkdirAll(resolvedDataDir, 0o755); err != nil {
+		slog.Error("create data dir", "dir", resolvedDataDir, "error", err)
+		os.Exit(1)
+	}
+
+	// Retention (env > default 30 days). Files older than this are deleted
+	// by the background cleanup loop. Set RETENTION_DAYS=0 to disable cleanup.
+	retentionDays := defaultRetentionDays
+	if v := os.Getenv("RETENTION_DAYS"); v != "" {
+		if parsed, err := strconv.Atoi(v); err == nil && parsed >= 0 {
+			retentionDays = parsed
+		}
+	}
+
 	s := &server{
-		files:         make(map[string]fileEntry),
-		responses:     make(map[string]chan []byte),
-		expectedToken: resolvedToken,
+		files:          make(map[string]fileEntry),
+		responses:      make(map[string]chan []byte),
+		expectedToken:  resolvedToken,
+		dataDir:        resolvedDataDir,
+		retentionHours: time.Duration(retentionDays) * 24 * time.Hour,
 	}
 
 	mux := http.NewServeMux()
@@ -84,9 +119,84 @@ func main() {
 	} else if os.Getenv("STORAGE_SAAS_TOKEN") != "" {
 		tokenSource = "env"
 	}
-	slog.Info("saas-stub listening", "addr", resolvedAddr, "token_source", tokenSource)
+	slog.Info("saas-stub listening",
+		"addr", resolvedAddr,
+		"token_source", tokenSource,
+		"data_dir", resolvedDataDir,
+		"retention_days", retentionDays,
+	)
+
+	if retentionDays > 0 {
+		go s.runCleanupLoop()
+	} else {
+		slog.Warn("retention disabled (RETENTION_DAYS=0) — files will accumulate forever")
+	}
+
 	if err := http.ListenAndServe(resolvedAddr, mux); err != nil {
 		slog.Error("server failed", "error", err)
+	}
+}
+
+// runCleanupLoop walks the data dir periodically and deletes files whose mtime
+// is older than the retention window. Initial delay avoids hammering disk
+// right after boot.
+func (s *server) runCleanupLoop() {
+	time.Sleep(cleanupInitialDelay)
+	for {
+		s.runCleanupOnce()
+		time.Sleep(cleanupInterval)
+	}
+}
+
+func (s *server) runCleanupOnce() {
+	cutoff := time.Now().Add(-s.retentionHours)
+	deleted := 0
+	var freedBytes int64
+
+	err := filepath.Walk(s.dataDir, func(walkPath string, info os.FileInfo, err error) error {
+		if err != nil {
+			slog.Warn("cleanup walk error", "path", walkPath, "error", err)
+			return nil
+		}
+		if info.IsDir() {
+			return nil
+		}
+		if info.ModTime().After(cutoff) {
+			return nil
+		}
+		size := info.Size()
+		if err := os.Remove(walkPath); err != nil {
+			slog.Warn("cleanup delete failed", "path", walkPath, "error", err)
+			return nil
+		}
+		deleted++
+		freedBytes += size
+		return nil
+	})
+	if err != nil {
+		slog.Error("cleanup walk failed", "error", err)
+		return
+	}
+
+	// Best-effort empty-directory cleanup so the tree doesn't grow boundlessly
+	// with hollow client folders. Errors here are non-fatal.
+	_ = filepath.Walk(s.dataDir, func(walkPath string, info os.FileInfo, err error) error {
+		if err != nil || !info.IsDir() || walkPath == s.dataDir {
+			return nil
+		}
+		entries, readErr := os.ReadDir(walkPath)
+		if readErr == nil && len(entries) == 0 {
+			_ = os.Remove(walkPath)
+		}
+		return nil
+	})
+
+	if deleted > 0 {
+		slog.Info("cleanup completed",
+			"deleted_files", deleted,
+			"freed_mb", fmt.Sprintf("%.2f", float64(freedBytes)/(1024*1024)),
+			"retention_days", int(s.retentionHours.Hours()/24),
+		)
 	}
 }
 
@@ -149,24 +259,29 @@ func (s *server) handleFile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Delete-after-fetch: keeps the in-memory queue empty as soon as the agent
-	// picks up the file. Satisfies the operational rule of never persisting
-	// client data on our server — file lives in RAM only for the few seconds
-	// between Laravel's POST and the agent's GET.
+	// Look up disk path from the in-memory index. The file stays on disk so
+	// the background cleanup loop can prune it after the retention window.
 	s.mu.Lock()
 	entry, ok := s.files[id]
-	if ok {
-		delete(s.files, id)
-	}
 	s.mu.Unlock()
 	if !ok {
 		http.NotFound(w, r)
 		return
 	}
 
+	file, err := os.Open(entry.DiskPath)
+	if err != nil {
+		slog.Error("open file failed", "path", entry.DiskPath, "error", err)
+		http.Error(w, "internal storage error", http.StatusInternalServerError)
+		return
+	}
+	defer file.Close()
+
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"`, entry.Filename))
-	_, _ = w.Write(entry.Content)
+	if _, err := io.Copy(w, file); err != nil {
+		slog.Warn("stream file failed", "path", entry.DiskPath, "error", err)
+	}
 }
 
 func (s *server) handleUpload(w http.ResponseWriter, r *http.Request) {
@@ -193,22 +308,48 @@ func (s *server) handleUpload(w http.ResponseWriter, r *http.Request) {
 	}
 	defer file.Close()
 
-	body, err := io.ReadAll(file)
-	if err != nil {
-		http.Error(w, "read file: "+err.Error(), http.StatusBadRequest)
-		return
-	}
-
 	filename := header.Filename
 	if filename == "" {
 		http.Error(w, "filename required", http.StatusBadRequest)
 		return
 	}
 
+	// Reject anything that could escape the data dir or be a Windows-style
+	// path. The agent has its own per-segment validator, but a hostile client
+	// could still poison our local disk before the file ever reaches the
+	// agent — so we rebuild a safe-relative path here too.
+	safeRel, err := safeJoinClientPath(client, filename)
+	if err != nil {
+		http.Error(w, "invalid client/filename: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	diskPath := filepath.Join(s.dataDir, safeRel)
+	if err := os.MkdirAll(filepath.Dir(diskPath), 0o755); err != nil {
+		http.Error(w, "mkdir failed: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	out, err := os.Create(diskPath)
+	if err != nil {
+		http.Error(w, "create file: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if _, err := io.Copy(out, file); err != nil {
+		out.Close()
+		_ = os.Remove(diskPath)
+		http.Error(w, "write file: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if err := out.Close(); err != nil {
+		_ = os.Remove(diskPath)
+		http.Error(w, "close file: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
 	s.mu.Lock()
 	s.nextID++
 	id := fmt.Sprintf("%d", s.nextID)
-	s.files[id] = fileEntry{Filename: filename, Client: client, Content: body}
+	s.files[id] = fileEntry{Filename: filename, Client: client, DiskPath: diskPath}
 	s.mu.Unlock()
 
 	cmd := map[string]string{
@@ -318,6 +459,36 @@ func (s *server) handleAgentResponse(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// safeJoinClientPath builds a relative path "<client>/<filename>" rejecting
+// inputs that could escape the storage root (path traversal, absolute paths,
+// drive letters, backslashes, null bytes). The agent already does a strict
+// per-segment validation, but we also enforce it here so a malformed upload
+// can't dump files outside the data dir on this side.
+func safeJoinClientPath(client, filename string) (string, error) {
+	if client == "" || filename == "" {
+		return "", fmt.Errorf("client and filename required")
+	}
+	if strings.ContainsAny(client+filename, "\x00\\") {
+		return "", fmt.Errorf("backslash or null byte not allowed")
+	}
+	// Client can contain forward-slash separators (e.g. "Acme/2026/05/inbox").
+	// Validate each segment; reject anything that resolves outside.
+	for _, seg := range strings.Split(client, "/") {
+		if seg == "" || seg == "." || seg == ".." {
+			return "", fmt.Errorf("invalid client segment: %q", seg)
+		}
+	}
+	if strings.ContainsAny(filename, "/\\") || filename == "." || filename == ".." {
+		return "", fmt.Errorf("invalid filename: %q", filename)
+	}
+	rel := filepath.Join(client, filename)
+	clean := filepath.Clean(rel)
+	if strings.HasPrefix(clean, "..") || filepath.IsAbs(clean) {
+		return "", fmt.Errorf("path escapes data dir: %q", clean)
+	}
+	return clean, nil
 }
 
 func (s *server) sendToAgent(cmd map[string]string) error {

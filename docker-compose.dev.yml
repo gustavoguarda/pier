@@ -1,0 +1,32 @@
+# Local dev compose for the saas-stub reference implementation.
+#
+# The stub listens on 0.0.0.0:9000 so an agent running on another machine
+# (e.g. a Windows VM) can reach it. Uploaded files are persisted under ./data
+# and pruned by the stub's built-in cleanup loop after RETENTION_DAYS.
+#
+# Use:
+#   docker compose -f docker-compose.dev.yml up -d --build
+#   docker compose -f docker-compose.dev.yml logs -f saas-stub
+#   docker compose -f docker-compose.dev.yml down
+
+services:
+  saas-stub:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    ports:
+      - "9000:9000"
+    environment:
+      PORT: "9000"
+      STORAGE_SAAS_TOKEN: dev-token
+      STORAGE_DATA_DIR: /data
+      RETENTION_DAYS: "30"
+    volumes:
+      - ./data:/data
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:9000/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
